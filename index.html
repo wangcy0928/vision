@@ -48,12 +48,12 @@
 <div id="start">
   <h1>Vision</h1>
   <ul>
-    <li><b>Walk.</b> Beeps warn you about things in your way: left ear "tok", right ear "ting", ahead "bzz". Faster = closer.</li>
-    <li><b>Point</b> at something and hold still, or <b>tap</b>, to hear what it is.</li>
-    <li><b>Hold the screen</b> and ask anything: "Read this", "What's in front of me?"</li>
-    <li>Say <b>"Find the door"</b>, then turn in a circle and follow the beeps to it. Say "stop" to end.</li>
+    <li><b>Hold the screen</b> until the beep, then speak: "Find the door", "Read this poster", or any question.</li>
+    <li><b>Double-tap</b> for obstacle mode: left ear "tok", right ear "ting", ahead "bzz". Faster = closer.</li>
+    <li><b>Tap once</b> to stop everything and go back to standby.</li>
+    <li><b>Point</b> at something and hold still to hear what it is.</li>
   </ul>
-  <button id="go" aria-label="Start. Later, tap to hear what is ahead, or hold the screen to ask a question or to say find the door.">Tap to start</button>
+  <button id="go" aria-label="Start. Later, hold the screen until the beep to say find the door or read this. Double-tap for obstacle mode. Tap once to go back to standby.">Tap to start</button>
 </div>
 <div id="foot">Prototype for IPD 5900 at Penn · not a mobility aid</div>
 
@@ -64,7 +64,7 @@ import { ObjectDetector, HandLandmarker, FilesetResolver } from "https://cdn.jsd
 // Any number below can be overridden from the URL for tuning on the phone, e.g. ?near=0.5&close=0.85
 const Q = new URLSearchParams(location.search);
 const num = (k, d) => Q.has(k) && isFinite(+Q.get(k)) ? +Q.get(k) : d;
-const VERSION = "v1";
+const VERSION = "v2";
 // Echo (obstacle radar from single-camera depth). Closeness is 0-1: 1 = as near as the nearest thing in view.
 const NEAR = num("near", .6);        // beeping starts
 const CLOSE = num("close", .9);      // always beeps and speaks; the only level that still warns during Find
@@ -140,7 +140,7 @@ function show(text, cls) {
   const a = $("answer"); a.textContent = text; a.className = cls === true ? "locked" : cls || ""; a.style.display = text ? "block" : "none";
 }
 const finding = () => state.mode !== "idle";
-function ready() { status(hands ? "Point, tap, or hold to talk" : "Tap, or hold to talk", "on"); }
+function ready() { status(echo.muted ? "Standby · hold to talk" : "Obstacle mode · hold to talk", "on"); }
 let lastSpoke = 0;
 function say(text, rate = 1.05) {
   speechSynthesis.cancel();
@@ -553,7 +553,7 @@ function loop() {
   stats.frames++;
   if (now - stats.at > 1000) {
     stats.fps = Math.round(stats.frames * 1000 / (now - stats.at)); stats.frames = 0; stats.at = now;
-    const dep = echo.ready ? `${echo.device} ${Math.round(echo.ms)} ms${echo.muted ? " paused" : ""}` : echo.err ? "OFF" : "loading";
+    const dep = echo.ready ? `${echo.device} ${Math.round(echo.ms)} ms${echo.muted ? " (off)" : ""}` : echo.err ? "OFF" : "loading";
     $("foot").textContent = `${wideCam ? "wide" : "normal"} cam · depth ${dep} · hand ${hands ? "on" : "-"} · motion ${gyroOK ? "on" : "OFF"} · AI ${stats.aiMs ? Math.round(stats.aiMs) + " ms" : "-"} · ${stats.fps} fps · ${VERSION}`;
   }
   requestAnimationFrame(loop);
@@ -596,7 +596,7 @@ function setCam(wide) {      // calls are queued, and only the latest wish is ca
 // A depth model (in depth-worker.js) says how close things are in three strips of the view: left, ahead, right.
 // Each side has its own timbre AND its own ear:  left = low "tok", right = high "ting", ahead = "bzz" in both.
 // Distance is carried by speed (closer = faster). It stays quiet when nothing changes.
-const echo = { ready: false, err: "", device: "", ms: 0, pending: false, sent: 0, at: 0, muted: false,
+const echo = { ready: false, err: "", device: "", ms: 0, pending: false, sent: 0, at: 0, muted: true,
   cols: [0, 0, 0], side: 1, c: 0, since: 0, hist: [], thumb: null, tw: 0, th: 0, lastSpeak: 0, lastKey: "" };
 const SIDES = ["left", "ahead", "right"];
 let depthWorker = null, lastHandSeen = 0;
@@ -610,10 +610,10 @@ function startDepth() {
     window.__dw = depthWorker;   // for testing from the console
     depthWorker.onmessage = e => {
       const m = e.data;
-      if (m.type === "ready") { echo.ready = true; echo.device = m.device === "webgpu" ? "gpu" : "cpu"; }
+      if (m.type === "ready") { echo.ready = true; echo.device = m.device === "webgpu" ? "gpu" : "cpu"; if (!echo.muted && !finding() && !speaking()) say("Obstacle mode ready."); }
       else if (m.type === "error") {
         echo.pending = false;
-        if (!echo.ready) { echo.err = m.msg; if (!speaking()) say("The obstacle radar could not start. The other features still work."); }
+        if (!echo.ready) { echo.err = m.msg; if (!echo.muted) { echo.muted = true; ready(); say("Obstacle mode could not start. The other features still work."); } }
       }
       else if (m.type === "depth") onDepth(m);
     };
@@ -689,7 +689,7 @@ function echoTick() {
   setTimeout(echoTick, wait);
 }
 function echoSpeak(now) {
-  if (finding() || busy || listening || speaking() || echo.c < CLOSE || now - lastHandSeen < 1200) return;
+  if (echo.muted || finding() || busy || listening || speaking() || echo.c < CLOSE || now - lastHandSeen < 1200) return;
   const key = SIDES[echo.side];
   if (now - echo.lastSpeak < 2500) return;
   if (key !== echo.lastKey || now - echo.lastSpeak > 6000) {
@@ -698,7 +698,7 @@ function echoSpeak(now) {
   }
 }
 function drawEcho() {
-  if (!echo.ready || performance.now() - echo.at > 2000) return;
+  if (!echo.ready || echo.muted || performance.now() - echo.at > 2000) return;
   const d = DPR, w = cv.width, bw = w * .26, gap = w * .03, x0 = (w - bw * 3 - gap * 2) / 2, y = cv.height - 150 * d;
   // three bars: how close things are on the left, ahead and on the right
   for (let i = 0; i < 3; i++) {
@@ -826,7 +826,7 @@ $("go").onclick = async e => {
   } catch (err) { status("Camera blocked"); say("I can't open the camera. Check Safari camera permission."); return; }
   started = true;
   ready();
-  say("Ready. Tap to hear what's ahead. Hold the screen to ask a question, or say: find the door.");
+  say("Ready. Hold the screen until the beep, then say find the door, or read this. Double-tap for obstacle mode. Tap once for standby.");
   keepAwake();
   loop();
   echoTick();
@@ -888,13 +888,13 @@ function finishListening() {
 //   "read this", "what does it say"           -> read text aloud
 //   "what's in front of me", "describe"       -> describe the scene
 //   anything else                             -> the question goes to the AI with a photo
-//   "stop" ends Find · "pause" / "resume" switch the obstacle radar off and on
+//   "stop" ends Find · "standby" = single tap · "obstacle mode" = double-tap
 const FIND_RE = /^(please |can you |could you |help me |i want to |i need to )*(find|where'?s|where is|where are|look for|search for|take me to|go to|get me to|i'm looking for|i am looking for)\b/;
 function route(q) {
   const s = q.toLowerCase().replace(/[.,!?]/g, " ").replace(/\s+/g, " ").trim();
   if (/^(stop|cancel|never ?mind|quit|end)\b/.test(s)) { if (finding()) return stopFind("Stopped."); speechSynthesis.cancel(); return; }
-  if (/^(pause|mute|quiet|be quiet)\b/.test(s)) { echo.muted = true; return say("Radar paused. Say resume to turn it back on."); }
-  if (/^(resume|unmute|radar on)\b/.test(s)) { echo.muted = false; return say("Radar on."); }
+  if (/^(pause|mute|quiet|be quiet|standby)\b/.test(s)) return standby();
+  if (/^(resume|unmute|radar on|obstacle mode|obstacles)\b/.test(s)) return obstacleMode();
   if (finding() && /^(where is it|where|repeat|again)$/.test(s)) return tellWhere();
   if (/^where am i\b/.test(s)) return capture("scene");
   if (FIND_RE.test(s)) {
@@ -906,7 +906,25 @@ function route(q) {
   return capture("ask", q);
 }
 
-// ---------- press handling: long press = talk; short tap = where is it (during Find) or what's ahead ----------
+// ---------- press handling ----------
+//   long press (beep) = talk: Find, reading, questions
+//   single tap        = back to standby: stops Find, obstacle mode and speech
+//   double-tap        = obstacle mode (Echo)
+const DOUBLE_MS = 320;       // two taps closer together than this = double-tap
+let tapTimer = null;
+function standby() {
+  if (finding()) stopFind();
+  echo.muted = true; speechSynthesis.cancel(); show("");
+  tone(520, .1, .3); tone(390, .14, .3, 0, "sine", .1);          // falling = off
+  ready(); say("Standby.");
+}
+function obstacleMode() {
+  if (finding()) stopFind();
+  if (echo.err) { ready(); return say("Obstacle mode isn't available on this phone."); }
+  echo.muted = false; echo.at = 0; echo.cols = [0, 0, 0]; echo.c = 0; echo.lastKey = "";
+  tone(390, .1, .3); tone(520, .14, .3, 0, "sine", .1);          // rising = on
+  ready(); say(echo.ready ? "Obstacle mode on." : "Obstacle mode on. Still loading, one moment.");
+}
 let pressTimer = null, pressed = false;
 function down(e) {
   if (!started) return;
@@ -915,24 +933,28 @@ function down(e) {
 }
 function up() {
   if (!pressed) return; pressed = false;
-  if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; tap(); }
+  if (pressTimer) {
+    clearTimeout(pressTimer); pressTimer = null;
+    if (tapTimer) { clearTimeout(tapTimer); tapTimer = null; obstacleMode(); }
+    else tapTimer = setTimeout(() => { tapTimer = null; standby(); }, DOUBLE_MS);
+  }
   else if (listening) finishListening();
 }
-function tap() { if (finding()) tellWhere(); else capture("scene"); }
 document.addEventListener("pointerdown", down);
 document.addEventListener("pointerup", up);
 document.addEventListener("pointercancel", up);
 
-// Desktop recording shortcuts: hold space = talk, Enter = tap, t = read, Esc = stop Find
+// Desktop recording shortcuts: hold space = talk, Enter = single tap, d = double-tap, t = read, Esc = stop Find
 document.addEventListener("keydown", e => {
   if (!started || e.repeat) return;
   if (e.key === " ") { e.preventDefault(); startListening(); }
-  if (e.key === "Enter") tap();
+  if (e.key === "Enter") standby();
+  if (e.key === "d") obstacleMode();
   if (e.key === "t") capture("read");
   if (e.key === "Escape" && finding()) stopFind("Stopped.");
 });
 document.addEventListener("keyup", e => { if (e.key === " " && listening) finishListening(); });
-window.__vision = { route, state, echo, tap, onDepth }; // for testing from the console
+window.__vision = { route, state, echo, standby, obstacleMode }; // for testing from the console
 </script>
 </body>
 </html>

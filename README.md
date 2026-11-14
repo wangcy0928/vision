@@ -2,36 +2,37 @@
 
 One iPhone web app that combines the three **Body Interface** prototypes (IPD 5900, Penn) for blind navigation. Like Be My Eyes, with AI in place of the human volunteer.
 
-| Job | What it does | How you start it |
-|---|---|---|
-| **Echo** (always on) | Beeps warn you about things in your way | Nothing — it runs from the start |
-| **Explain** | Says what something is, reads text, answers questions | Point at it, tap, or hold the screen and ask |
-| **Find** | Guides you to one named thing | Hold the screen and say "find the door" |
+| Gesture | What it does |
+|---|---|
+| **Hold the screen** (wait for the beep, then speak) | Find ("find the door"), reading ("read this poster"), or any question |
+| **Double-tap** | Obstacle mode (Echo) on |
+| **Tap once** | Back to standby: stops Find, obstacle mode and speech |
+| **Point** at something and hold still | Says what it is |
 
-The original prototypes are untouched and still live in their own repos: `echo`, `point-explain`, `find`.
+The app starts in **standby**: camera on, nothing beeping. The original prototypes are untouched and still live in their own repos: `echo`, `point-explain`, `find`.
 
 ## Using it
 
-- **Walk.** Left ear "tok", right ear "ting", ahead "bzz" in both ears. Faster = closer. Very close → "Close, ahead."
-- **Point** at something and hold still for a second → "On your left. Exit sign, text reads EXIT."
-- **Tap** → what is in front of you. (During Find, tap → where the target is now.)
+- **Obstacle mode** (double-tap). Left ear "tok", right ear "ting", ahead "bzz" in both ears. Faster = closer. Very close → "Close, ahead."
 - **Hold the screen and talk.** What you say picks the job:
 
 | You say | What happens |
 |---|---|
 | "Find the door", "Where's a chair?", "Take me to the exit" | Find |
-| "Read this", "What does it say?" | Reads the text aloud |
+| "Read this", "Read the text on this poster", "What does it say?" | Reads the text aloud |
 | "What's in front of me?", "Describe", "Where am I?" | Describes the scene |
 | Anything else | The question goes to the AI with a photo |
+| "Where is it?" (during Find) | Says where the target is now |
 | "Stop" | Ends Find |
-| "Pause" / "Resume" | Turns the obstacle beeps off / on |
+| "Standby" / "Obstacle mode" | Same as a single tap / a double-tap |
 
-On a computer: hold Space to talk, Enter = tap, `t` = read, Esc = stop Find.
+- **Point** at something and hold still for a second → "On your left. Exit sign, text reads EXIT."
+
+On a computer: hold Space to talk, Enter = single tap, `d` = double-tap, `t` = read, Esc = stop Find.
 
 ## How the three share one phone
 
-- **Sound.** While Find is running, Echo goes quiet except for something very close, and then it uses a low hum instead of its usual beeps, so it can't be mistaken for Find's guidance. Once Find is locked on, "ahead" is ignored (you are walking straight at the target).
-- **Tap** depends on what is running (see above).
+- **Sound.** If obstacle mode is on while Find is running, Echo goes quiet except for something very close, and then it uses a low hum instead of its usual beeps, so it can't be mistaken for Find's guidance. Once Find is locked on, "ahead" is ignored (you are walking straight at the target).
 - **Finger pointing** is switched off while Find is running, to save the phone's processing power.
 - **Camera.** Normal lens by default. Find switches to the ultra-wide lens and switches back when it ends (about half a second each way). A web page on an iPhone can only use one camera at a time. `?wide=0` turns the ultra-wide lens off.
 
