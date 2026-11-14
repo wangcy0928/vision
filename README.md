@@ -60,7 +60,7 @@ iPhone: Safari needs camera, microphone and Motion & Orientation permission (ask
 
 ## Tuning from the URL
 
-`?near=0.6` beeping starts · `?close=0.9` "close" warning · `?depthms=250` pause between depth frames · `?dsize=224` depth frame size · `?depth=0` no obstacle radar · `?hands=0` no finger pointing · `?wide=0` no ultra-wide lens
+`?near=0.6` beeping starts · `?close=0.9` "close" warning · `?depthms=250` pause between depth frames · `?dsize=224` depth frame size · `?depth=0` no obstacle radar · `?hands=0` no finger pointing · `?wide=0` no ultra-wide lens · `?double=450` double-tap window in ms
 
 The line at the bottom of the screen shows: camera, depth (gpu/cpu and time per frame, or OFF), hand model, motion sensor, AI time, fps, version.
 

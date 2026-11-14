@@ -64,7 +64,7 @@ import { ObjectDetector, HandLandmarker, FilesetResolver } from "https://cdn.jsd
 // Any number below can be overridden from the URL for tuning on the phone, e.g. ?near=0.5&close=0.85
 const Q = new URLSearchParams(location.search);
 const num = (k, d) => Q.has(k) && isFinite(+Q.get(k)) ? +Q.get(k) : d;
-const VERSION = "v2";
+const VERSION = "v3";
 // Echo (obstacle radar from single-camera depth). Closeness is 0-1: 1 = as near as the nearest thing in view.
 const NEAR = num("near", .6);        // beeping starts
 const CLOSE = num("close", .9);      // always beeps and speaks; the only level that still warns during Find
@@ -797,9 +797,12 @@ async function capture(mode, question, target) {
     const r = await fetch("/api/describe", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ image, mode, question }) });
     const j = await r.json();
-    const text = j.text || "Sorry, I couldn't get an answer.";
-    show(text, mode === "read" ? "read" : "");
-    say((mode === "point" ? side(target.x) : "") + text, mode === "read" ? 0.95 : 1.05);
+    if (j.error) { show("Server: " + j.error); say("Sorry, the server had a problem."); }
+    else {
+      const text = j.text || "Sorry, I couldn't get an answer.";
+      show(text, mode === "read" ? "read" : "");
+      say((mode === "point" ? side(target.x) : "") + text, mode === "read" ? 0.95 : 1.05);
+    }
   } catch (err) { show("No connection"); say("No connection. Try again."); }
   busy = false; lastAsk = performance.now();
   if (finding()) status("Finding " + state.target, "busy"); else if (!wasFinding || !finding()) ready();
@@ -910,7 +913,7 @@ function route(q) {
 //   long press (beep) = talk: Find, reading, questions
 //   single tap        = back to standby: stops Find, obstacle mode and speech
 //   double-tap        = obstacle mode (Echo)
-const DOUBLE_MS = 320;       // two taps closer together than this = double-tap
+const DOUBLE_MS = num("double", 450);   // two taps closer together than this = double-tap
 let tapTimer = null;
 function standby() {
   if (finding()) stopFind();
