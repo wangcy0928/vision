@@ -1,0 +1,938 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Vision</title>
+<style>
+  :root { --amber:#ffb000; --go:#30d158; --ink:#fff; --bg:#000; --mic:#ff3b30; }
+  * { box-sizing:border-box; margin:0; padding:0; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  html, body { height:100%; background:var(--bg); color:var(--ink);
+    font-family:-apple-system, "SF Pro Text", system-ui, sans-serif; overflow:hidden; touch-action:none; }
+  #stage { position:fixed; inset:0; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #status { position:fixed; top:calc(env(safe-area-inset-top) + 14px); left:16px; right:16px;
+    font-size:15px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+    display:flex; align-items:center; gap:8px; text-shadow:0 1px 4px #000; pointer-events:none; }
+  #dot { width:10px; height:10px; border-radius:50%; background:#666; flex:none; }
+  #dot.on { background:var(--go); } #dot.busy { background:var(--amber); animation:pulse .8s infinite alternate; }
+  #dot.mic { background:var(--mic); animation:pulse .4s infinite alternate; }
+  @keyframes pulse { to { opacity:.3; } }
+  #heard { position:fixed; top:calc(env(safe-area-inset-top) + 42px); left:16px; right:16px;
+    font-size:20px; font-style:italic; color:#ddd; text-shadow:0 1px 4px #000; pointer-events:none; }
+  #answer { position:fixed; left:16px; right:16px; bottom:calc(env(safe-area-inset-bottom) + 24px);
+    font-size:28px; line-height:1.18; font-weight:700; background:rgba(0,0,0,.75);
+    padding:18px 20px; border-radius:18px; border:2px solid var(--amber); display:none; pointer-events:none; }
+  #answer { max-height:50vh; overflow:hidden; }
+  #answer.locked { border-color:var(--go); }
+  #answer.read { font-size:22px; font-weight:600; }
+  #listening { position:fixed; inset:0; border:10px solid var(--mic); display:none; pointer-events:none; }
+  #start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:20px; background:#000; z-index:5; padding:24px; text-align:center; }
+  #start h1 { font-size:44px; }
+  #start ul { list-style:none; font-size:17px; color:#bbb; max-width:330px; line-height:1.45; text-align:left; }
+  #start li { margin:6px 0; } #start b { color:#fff; }
+  #start button { font-size:26px; font-weight:700; padding:28px 0; width:100%; max-width:340px;
+    border-radius:22px; border:none; background:var(--amber); color:#000; }
+  #foot { position:fixed; bottom:4px; width:100%; text-align:center; font-size:10px; color:#aaa; pointer-events:none; text-shadow:0 1px 2px #000; }
+</style>
+</head>
+<body>
+<div id="stage"><video id="cam" playsinline muted autoplay></video><canvas id="fx"></canvas></div>
+<div id="listening"></div>
+<div id="status"><span id="dot"></span><span id="statusText">Starting</span></div>
+<div id="heard"></div>
+<div id="answer" aria-live="polite"></div>
+
+<div id="start">
+  <h1>Vision</h1>
+  <ul>
+    <li><b>Walk.</b> Beeps warn you about things in your way: left ear "tok", right ear "ting", ahead "bzz". Faster = closer.</li>
+    <li><b>Point</b> at something and hold still, or <b>tap</b>, to hear what it is.</li>
+    <li><b>Hold the screen</b> and ask anything: "Read this", "What's in front of me?"</li>
+    <li>Say <b>"Find the door"</b>, then turn in a circle and follow the beeps to it. Say "stop" to end.</li>
+  </ul>
+  <button id="go" aria-label="Start. Later, tap to hear what is ahead, or hold the screen to ask a question or to say find the door.">Tap to start</button>
+</div>
+<div id="foot">Prototype for IPD 5900 at Penn · not a mobility aid</div>
+
+<script type="module">
+import { ObjectDetector, HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- tuning ----------
+// Any number below can be overridden from the URL for tuning on the phone, e.g. ?near=0.5&close=0.85
+const Q = new URLSearchParams(location.search);
+const num = (k, d) => Q.has(k) && isFinite(+Q.get(k)) ? +Q.get(k) : d;
+const VERSION = "v1";
+// Echo (obstacle radar from single-camera depth). Closeness is 0-1: 1 = as near as the nearest thing in view.
+const NEAR = num("near", .6);        // beeping starts
+const CLOSE = num("close", .9);      // always beeps and speaks; the only level that still warns during Find
+const DEPTH_MS = num("depthms", 250);     // pause between depth frames when idle
+const DEPTH_FIND_MS = 700;                // ...and while Find is running (keeps Find smooth)
+const DEPTH_SIDE = Math.round(num("dsize", 224) / 14) * 14;   // long side of the frame sent to the depth model
+// Point & Explain
+const HOLD_MS = 1000;        // finger must stay still this long
+const STILL_PX = 0.04;       // allowed jitter (fraction of frame width)
+const REACH = 1.6;           // how far past the fingertip the target sits (in finger-segment lengths)
+const COOLDOWN_MS = 3500;
+const REARM_DIST = 0.15;     // how far the target must move to describe a new thing
+const DROP_MS = 500;         // hand out of pointing pose this long = re-armed
+const DETECT_EVERY = 80;     // ms between hand detections
+// Find
+const PRESS_MS = 350;        // press longer than this = talk, shorter = tap
+const LOCK_DEG = 9;          // within this many degrees = "facing it"
+const LOCK_MS = 350;         // must stay facing it this long before announcing
+const AI_GAP_MS = 100;       // pause between requests per worker (3 workers)
+const FAST_TURN = 130;       // deg/s: faster than this for a while = ask the user to slow down
+const LOCAL_EVERY = 80;     // ms between on-device detections
+const FIX_TTL_AI = 6000;     // trust an AI fix this long without gyro
+const FIX_TTL_GYRO = 20000;  // with gyro the bearing stays good much longer
+const MAX_TURN_FOR_PHOTO = 110; // deg/s: turning faster than this blurs the photo, so wait
+const TRACK_EVERY = 60;      // ms between on-device tracking steps (between AI answers)
+const FIX_TTL_LOCAL = 1500;
+const LOST_MS = 10000;       // no sighting this long while locked = lost
+const GIVE_UP_DEG = 340;     // searched a full circle without seeing it
+const GIVE_UP_MS = 35000;
+const ARRIVE_STEPS = 1;
+const STEP_M = 0.7;
+
+// Things the phone can spot on its own (fast, no network). Anything else goes to the AI.
+const COCO = {
+  chair:"chair", chairs:"chair", seat:"chair", person:"person", someone:"person", people:"person", man:"person", woman:"person",
+  table:"dining table", desk:"dining table", couch:"couch", sofa:"couch", bench:"bench", bed:"bed",
+  toilet:"toilet", sink:"sink", fridge:"refrigerator", refrigerator:"refrigerator", microwave:"microwave", oven:"oven",
+  tv:"tv", television:"tv", laptop:"laptop", computer:"laptop", phone:"cell phone", "cell phone":"cell phone",
+  cup:"cup", mug:"cup", bottle:"bottle", "water bottle":"bottle", book:"book", clock:"clock", plant:"potted plant",
+  backpack:"backpack", bag:"handbag", handbag:"handbag", suitcase:"suitcase", umbrella:"umbrella",
+  bike:"bicycle", bicycle:"bicycle", car:"car", bus:"bus", "stop sign":"stop sign", "traffic light":"traffic light",
+  "fire hydrant":"fire hydrant", dog:"dog", cat:"cat", keyboard:"keyboard", mouse:"mouse", remote:"remote"
+};
+// rough real heights (m) used to guess distance from box size
+const HEIGHT_M = { person:1.7, chair:.9, "dining table":.75, couch:.8, bench:.8, bed:.6, toilet:.75, sink:.25,
+  refrigerator:1.7, microwave:.3, oven:.9, tv:.6, laptop:.25, "cell phone":.15, cup:.1, bottle:.25, book:.25,
+  clock:.3, "potted plant":.6, backpack:.5, handbag:.3, suitcase:.65, umbrella:1, bicycle:1, car:1.5, bus:3,
+  "stop sign":.75, "traffic light":.9, "fire hydrant":.7, dog:.5, cat:.3, keyboard:.05, mouse:.04, remote:.05 };
+
+const $ = id => document.getElementById(id);
+const video = $("cam"), cv = $("fx"), cx = cv.getContext("2d");
+let actx, detector = null, hands = null, listening = false, busy = false, stream = null, lastFrameAt = 0, lastVT = -1, lastKick = 0;
+// iOS Safari can pause the camera preview when speech starts. Nudge it; re-attach only as a last resort.
+function watchFrames() {
+  if (!video.requestVideoFrameCallback) return;
+  const tick = () => { lastFrameAt = performance.now(); video.requestVideoFrameCallback(tick); };
+  video.requestVideoFrameCallback(tick);
+}
+function cameraWatchdog(now) {
+  if (!stream) return;
+  if (!video.requestVideoFrameCallback && video.currentTime !== lastVT) { lastVT = video.currentTime; lastFrameAt = now; }
+  if (!lastFrameAt) { lastFrameAt = now; return; }
+  const stuck = now - lastFrameAt;
+  if (stuck > 600 && now - lastKick > 1000) {
+    lastKick = now;
+    if (stuck > 4000) { video.srcObject = null; video.srcObject = stream; watchFrames(); lastFrameAt = now; }
+    video.muted = true; video.play().catch(() => {});
+  }
+}
+const stats = { aiMs: 0, aiN: 0, last: "-", frames: 0, fps: 0, at: 0 };
+function status(t, cls) { $("statusText").textContent = t; $("dot").className = cls || ""; }
+function show(text, cls) {
+  const a = $("answer"); a.textContent = text; a.className = cls === true ? "locked" : cls || ""; a.style.display = text ? "block" : "none";
+}
+const finding = () => state.mode !== "idle";
+function ready() { status(hands ? "Point, tap, or hold to talk" : "Tap, or hold to talk", "on"); }
+let lastSpoke = 0;
+function say(text, rate = 1.05) {
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text); u.rate = rate; u.lang = "en-US";
+  speechSynthesis.speak(u); lastSpoke = performance.now();
+}
+const speaking = () => speechSynthesis.speaking && performance.now() - lastSpoke < 15000;
+function tone(freq, dur, vol, pan = 0, type = "sine", when = 0) {
+  if (!actx) return;
+  const t = actx.currentTime + when;
+  const o = actx.createOscillator(), g = actx.createGain(), p = actx.createStereoPanner();
+  o.type = type; o.frequency.value = freq; p.pan.value = Math.max(-1, Math.min(1, pan));
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+  o.connect(g).connect(p).connect(actx.destination); o.start(t); o.stop(t + dur);
+}
+const chimeLock = () => { tone(880, .15, .3); tone(1320, .25, .3, 0, "sine", .12); };
+const chimeArrive = () => { tone(1320, .15, .3); tone(1760, .15, .3, 0, "sine", .13); tone(2200, .35, .3, 0, "sine", .26); };
+
+// ---------- heading: which way the camera faces (degrees, + = turned right) ----------
+// From deviceorientation (gyro-fused on iPhone). Uses the full rotation matrix, so it
+// stays stable when the phone is held upright, where Euler angles are degenerate.
+let rawYaw = 0, gyroOK = false, lastHeading = null, lastOri = 0, turnRate = 0;
+const yawSign = 1;
+function onOrient(e) {
+  if (e.alpha === null || e.beta === null || e.gamma === null) return;
+  const r = Math.PI / 180, a = e.alpha * r, b = e.beta * r, g = e.gamma * r;
+  const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), cg = Math.cos(g), sg = Math.sin(g);
+  // camera looks along device -z; R = Rz(a)·Rx(b)·Ry(g); v = R·(0,0,-1)
+  const vx = -(ca * sg + sa * sb * cg), vy = -(sa * sg - ca * sb * cg);
+  if (Math.hypot(vx, vy) < .2) return;           // pointing at floor/ceiling: heading meaningless
+  const h = Math.atan2(vx, vy) / r;              // clockwise from alpha's zero
+  if (lastHeading !== null) {
+    let d = h - lastHeading; d = ((d + 540) % 360) - 180;   // unwrap
+    rawYaw += d;
+    const dt = Math.max(.005, (performance.now() - lastOri) / 1000);
+    turnRate = turnRate * .7 + Math.abs(d / dt) * .3;
+    if (state.mode === "search") state.turned += Math.abs(d);
+  }
+  lastHeading = h; gyroOK = true; lastOri = performance.now();
+}
+const yaw = () => rawYaw;
+function learnSign() {}
+
+// ---------- search state ----------
+const state = {
+  mode: "idle",           // idle | search | locked
+  target: "", coco: null, session: 0,
+  fix: null,              // { m: offset deg at capture, raw: rawYaw at capture, at, box, steps, label, note, local }
+  prevFix: null, lastSeen: 0, startedAt: 0, turned: 0,
+  centeredSince: 0, lastSteps: null, lastDistSaid: 0, lastTarget: ""
+};
+let LONG_FOV = 64, wideCam = false, started = false;
+// angle (deg, + = right) of a horizontal position 0-1 in the frame
+function angOf(x) { return Math.atan((x - .5) * 2 * Math.tan(hfov() * Math.PI / 360)) * 180 / Math.PI; }
+function fovOf(px, longPx) { return 2 * Math.atan(Math.tan(LONG_FOV * Math.PI / 360) * px / longPx) * 360 / Math.PI; }
+function hfov() { const w = video.videoWidth || 4, h = video.videoHeight || 3; return fovOf(w, Math.max(w, h)); }
+function vfov() { const w = video.videoWidth || 4, h = video.videoHeight || 3; return fovOf(h, Math.max(w, h)); }
+function offsetDeg() {   // where the target is now, relative to straight ahead (+ = right)
+  const f = state.fix; if (!f) return null;
+  const ttl = f.local ? FIX_TTL_LOCAL : gyroOK ? FIX_TTL_GYRO : FIX_TTL_AI;
+  if (performance.now() - f.at > ttl) return null;
+  return (yawSign * f.raw + f.m) - yaw();
+}
+function turnWords(off) {   // what to do, in the fewest words
+  const a = Math.abs(off), s = off < 0 ? "left" : "right";
+  if (a < LOCK_DEG) return "straight ahead";
+  return a < 25 ? "a little " + s : a < 100 ? "turn " + s : "behind you, turn " + s;
+}
+function cue(text, gap, now, rate = 1.15) {   // short spoken hint, never interrupts speech
+  if (speaking() || now - (state.lastCue || 0) < gap) return false;
+  state.lastCue = now; say(text, rate); return true;
+}
+function sideWords(off) {
+  const a = Math.abs(off);
+  if (a < LOCK_DEG) return "ahead";
+  const s = off < 0 ? "left" : "right";
+  return a < 20 ? "slightly " + s : a < 45 ? "to your " + s : "far to your " + s;
+}
+
+function startFind(raw) {
+  const t = cleanTarget(raw);
+  if (!t) { say("Say what you want to find, like: find the door."); return; }
+  state.session++; track = null;
+  Object.assign(state, { aiMisses: 0, mode: "search", target: t, coco: COCO[t] || COCO[t.replace(/s$/, "")] || null,
+    fix: null, prevFix: null, lastSeen: 0, startedAt: performance.now(), turned: 0, centeredSince: 0,
+    lastSteps: null, lastDistSaid: 0, lastTarget: t, everSeen: false, lastCue: 0, offSince: 0, fastSince: 0 });
+  status("Finding " + t, "busy"); show("Finding: " + t);
+  say(`Looking for ${withArticle(t)}. Turn in a circle.`);
+  ring = null; anchor = null;
+  // Find sees more with the ultra-wide lens; switch to it first (about half a second)
+  const ses = state.session;
+  setCam(true).then(() => {
+    if (ses !== state.session) return;
+    state.startedAt = performance.now();
+    if (!state.coco || !detector) aiLoop(ses);
+  });
+}
+function stopFind(msg) {
+  state.mode = "idle"; state.session++; state.fix = null; track = null;
+  ready();
+  if (msg) say(msg);
+  setCam(false);            // back to the normal lens for pointing and the radar
+  setTimeout(() => { if (state.mode === "idle") show(""); }, 3000);
+}
+function cleanTarget(q) {
+  let s = q.toLowerCase().replace(/[.,!?]/g, " ").replace(/\s+/g, " ").trim();
+  s = s.replace(/^(please |can you |could you |help me |i want to |i need to |i'm looking for |i am looking for )+/, "");
+  s = s.replace(/^(find( me)?|where'?s|where is|where are|look for|search for|take me to|show me|go to|get me to)\s+/, "");
+  s = s.replace(/^(the|a|an|some|my|nearest|closest)\s+/, "").replace(/^(the|a|an)\s+/, "");
+  s = s.replace(/\s+(please|for me|here|nearby|around here)$/, "").trim();
+  return s.slice(0, 40);
+}
+function withArticle(t) { return /^(the |a |an |room |exit$)/.test(t) || /\d/.test(t) ? t : (/^[aeiou]/.test(t) ? "an " : "a ") + t; }
+
+// ---------- sightings ----------
+function accept(fix, session) {
+  if (session !== state.session || state.mode === "idle") return;
+  if (!fix) {   // looked, not seen
+    if (track && performance.now() - track.lastHit < 600) return;     // tracker still sees it: trust that
+    state.aiMisses = (state.aiMisses || 0) + 1;
+    // forget it only if it should have been in view twice in a row; if they turned away, the gyro still knows
+    const off = offsetDeg();
+    if (state.aiMisses >= 2 && state.fix && !state.fix.local && off !== null && Math.abs(off) < hfov() / 3) { state.fix = null; track = null; }
+    return;
+  }
+  state.aiMisses = 0;
+  const old = state.fix;
+  if (old && !fix.local && fix.cap < (old.cap || 0)) return;          // older photo than what we have
+  // smooth the distance
+  const rawSteps = fix.steps;
+  fix.dist = rawSteps && old && old.dist ? old.dist * .5 + rawSteps * .5 : rawSteps;
+  fix.steps = fix.dist ? Math.max(1, Math.round(fix.dist)) : null;
+  if (fix.box && (fix.box.h > .7 || fix.box.w > .8)) { fix.steps = 1; fix.dist = 1; }   // fills the view = you're there
+  if (!fix.local && fix.snap) {
+    // tracker already following it and agrees? keep tracker position, take the new size/distance/label
+    const curOff = offsetDeg();
+    const tb = track && curOff !== null && performance.now() - track.lastHit < 400 ? yaw() + curOff : null;
+    const bNew = fix.raw + fix.m;
+    if (tb !== null && Math.abs(tb - bNew) < 8) {
+      Object.assign(state.fix, { steps: fix.steps, dist: fix.dist, label: fix.label, note: fix.note, cap: fix.cap,
+        box: fix.box ? { ...fix.box, x: state.fix.box ? state.fix.box.x + state.fix.box.w / 2 - fix.box.w / 2 : fix.box.x } : state.fix.box });
+      state.lastSeen = performance.now();
+      return;
+    }
+    initTrack(fix);
+  }
+  if (old && !old.local && !fix.local && performance.now() - old.at < 3000) {
+    const bOld = old.raw + old.m, bNew = fix.raw + fix.m;
+    if (Math.abs(bNew - bOld) < 15) fix.m = (bOld * .4 + bNew * .6) - fix.raw;   // damp jumps
+  }
+  state.prevFix = fix; state.fix = fix; state.lastSeen = fix.at;
+  if (state.mode === "search" && !state.everSeen) {
+    state.everSeen = true;
+    const off = offsetDeg();
+    tone(990, .1, .4); tone(1320, .12, .4, 0, "sine", .1);
+    if (off !== null && Math.abs(off) >= LOCK_DEG) { state.lastCue = performance.now(); setTimeout(() => say("Found it. " + cap(turnWords(off)) + "."), 250); }
+  }
+}
+
+// AI path: two workers, staggered, so a fresh answer lands about every half second
+function aiLoop(session) { aiWorker(session); setTimeout(() => aiWorker(session), 300); setTimeout(() => aiWorker(session), 600); }
+async function aiWorker(session) {
+  const c = document.createElement("canvas"), g = c.getContext("2d");
+  while (session === state.session && state.mode !== "idle") {
+    // a photo taken mid-swing is blurry; wait (up to 0.4 s) for the turn to slow down
+    for (let t = 0; t < 2 && gyroOK && turnRate > MAX_TURN_FOR_PHOTO; t++) await new Promise(r => setTimeout(r, 100));
+    if (session !== state.session) return;
+    const cap = performance.now(), raw = rawYaw, W = wideCam ? 576 : 448, H = Math.round(W * video.videoHeight / video.videoWidth);
+    if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+    g.drawImage(video, 0, 0, W, H);
+    const snap = graySnap(c);
+    const image = c.toDataURL("image/jpeg", .6);
+    try {
+      const r = await fetch("/api/locate", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image, target: state.target }) });
+      const j = await r.json();
+      const ms = performance.now() - cap; stats.aiMs = stats.aiMs ? stats.aiMs * .7 + ms * .3 : ms; stats.aiN++;
+      stats.last = j.error ? "error" : j.found ? "seen" : "not seen";
+      if (j.error) { if (session === state.session) { stopFind("Sorry, the server had a problem."); show(j.error); } return; }
+      accept(j.found ? { m: angOf(j.x), raw, cap, snap, at: performance.now(), local: false,
+        box: j.w ? { x: j.x - j.w / 2, y: j.y - j.h / 2, w: j.w, h: j.h } : null,
+        steps: j.steps, label: j.label || state.target, note: j.note } : null, session);
+    } catch (e) {
+      if (session === state.session) stopFind("No connection. Try again.");
+      return;
+    }
+    await new Promise(r => setTimeout(r, AI_GAP_MS));
+  }
+}
+
+// ---------- on-device tracker ----------
+// Between AI answers (~0.5 s apart, ~1 s old), follow the found thing frame-to-frame by matching a
+// small grey patch of it. This is what keeps the beeps precise and continuous while you walk up to it.
+const TW = 160;
+const tcv = document.createElement("canvas"), tctx = tcv.getContext("2d", { willReadFrequently: true });
+let track = null, lastTrack = 0;
+function graySnap(src) {
+  const w = TW, h = Math.round(TW * src.height / src.width) || Math.round(TW * .75);
+  tcv.width = w; tcv.height = h; tctx.drawImage(src, 0, 0, w, h);
+  const d = tctx.getImageData(0, 0, w, h).data, g = new Uint8Array(w * h);
+  for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+  return { g, w, h };
+}
+function patch(sn, cx, cy, tw, th) {
+  const x0 = Math.round(cx - tw / 2), y0 = Math.round(cy - th / 2);
+  if (x0 < 0 || y0 < 0 || x0 + tw > sn.w || y0 + th > sn.h) return null;
+  const t = new Float32Array(tw * th); let m = 0;
+  for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) { const v = sn.g[(y0 + y) * sn.w + x0 + x]; t[y * tw + x] = v; m += v; }
+  m /= t.length; for (let i = 0; i < t.length; i++) t[i] -= m;
+  return t;
+}
+function initTrack(fix) {
+  if (!fix.box || !fix.snap) { track = null; return; }
+  const sn = fix.snap, b = fix.box;
+  const tw = Math.max(12, Math.min(36, Math.round(b.w * sn.w * .6)));
+  const th = Math.max(12, Math.min(36, Math.round(b.h * sn.h * .6)));
+  let cx = (b.x + b.w / 2) * sn.w, cy = (b.y + b.h / 2) * sn.h;
+  cx = Math.max(tw / 2 + 1, Math.min(sn.w - tw / 2 - 1, cx)); cy = Math.max(th / 2 + 1, Math.min(sn.h - th / 2 - 1, cy));
+  const tpl = patch(sn, cx, cy, tw, th);
+  // a flat patch (plain wall, blank door) matches anywhere: don't track it, rely on AI + gyro
+  let tex = 0; if (tpl) { for (const v of tpl) tex += Math.abs(v); tex /= tpl.length; }
+  track = tpl && tex >= 8 ? { tpl, tw, th, cx, cy, raw: fix.raw, misses: 0, lastHit: performance.now(), fresh: true } : null;
+}
+function score(sn, tr, cx, cy, best) {
+  const tw = tr.tw, th = tr.th, x0 = Math.round(cx - tw / 2), y0 = Math.round(cy - th / 2);
+  if (x0 < 0 || y0 < 0 || x0 + tw > sn.w || y0 + th > sn.h) return Infinity;
+  let m = 0, n = 0;
+  for (let y = 0; y < th; y += 2) for (let x = 0; x < tw; x += 2) { m += sn.g[(y0 + y) * sn.w + x0 + x]; n++; }
+  m /= n; let sad = 0; const lim = best * n;
+  for (let y = 0; y < th; y += 2) {
+    for (let x = 0; x < tw; x += 2) sad += Math.abs(sn.g[(y0 + y) * sn.w + x0 + x] - m - tr.tpl[y * tw + x]);
+    if (sad > lim) return Infinity;   // can't beat the best so far
+  }
+  return sad / n;
+}
+function trackStep(now) {
+  if (!track || !state.fix || state.fix.local || now - lastTrack < TRACK_EVERY || video.readyState < 2) return;
+  lastTrack = now;
+  const sn = graySnap(video), tr = track, pxPerDeg = sn.w / hfov();
+  // predict where it moved because the user turned
+  const px = tr.cx - (yaw() - tr.raw) * pxPerDeg, py = tr.cy;
+  if (px < tr.tw / 2 || px > sn.w - tr.tw / 2) { tr.raw = yaw(); tr.cx = px; return; }   // off screen: gyro holds it
+  const R = tr.fresh ? 26 : 16;
+  let best = 40, bx = 0, by = 0;
+  for (let dy = -R; dy <= R; dy += 2) for (let dx = -R; dx <= R; dx += 2) {
+    const sc = score(sn, tr, px + dx, py + dy, best); if (sc < best) { best = sc; bx = px + dx; by = py + dy; }
+  }
+  if (best < 40) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const sc = score(sn, tr, bx + dx, by + dy, best); if (sc < best) { best = sc; bx += dx; by += dy; dx = dy = 2; }
+  }
+  if (best > 22) { if (++tr.misses > 10) track = null; return; }
+  tr.misses = 0; tr.fresh = false; tr.cx = bx; tr.cy = by; tr.raw = yaw(); tr.lastHit = now;
+  // slowly adapt the patch so it keeps matching as the thing gets bigger
+  const np = patch(sn, bx, by, tr.tw, tr.th);
+  if (np) for (let i = 0; i < np.length; i++) tr.tpl[i] = tr.tpl[i] * .85 + np[i] * .15;
+  const f = state.fix;
+  f.m = angOf(bx / sn.w); f.raw = yaw(); f.at = now; state.lastSeen = now;
+  if (f.box) { f.box = { ...f.box, x: bx / sn.w - f.box.w / 2, y: by / sn.h - f.box.h / 2 }; }
+}
+
+// on-device path for common objects
+let lastLocal = 0;
+function localDetect(now) {
+  if (!detector || !state.coco || now - lastLocal < LOCAL_EVERY || video.readyState < 2) return;
+  lastLocal = now;
+  const res = detector.detectForVideo(video, now);
+  let best = null;
+  for (const d of res.detections || []) {
+    const c = d.categories && d.categories[0];
+    if (c && c.categoryName === state.coco && (!best || c.score > best.score)) best = { score: c.score, b: d.boundingBox };
+  }
+  if (!best) { if (state.fix && state.fix.local && now - state.fix.at > 600) state.fix = null; return; }
+  const vw = video.videoWidth, vh = video.videoHeight, b = best.b;
+  const box = { x: b.originX / vw, y: b.originY / vh, w: b.width / vw, h: b.height / vh };
+  const realH = HEIGHT_M[state.coco] || .5;
+  const meters = realH / (box.h * 2 * Math.tan(vfov() * Math.PI / 360));
+  accept({ m: angOf(box.x + box.w / 2), raw: rawYaw, cap: now, at: now, local: true, box,
+    steps: Math.max(1, Math.round(meters / STEP_M)), label: state.target, note: "" }, state.session);
+}
+
+// ---------- guidance: beeps + announcements ----------
+let nextBeep = 0;
+function guide(now) {
+  if (state.mode === "idle") return;
+  const off = offsetDeg(), quiet = speaking() ? .3 : 1;
+
+  if (off === null) {
+    // not seen yet: soft low tick so you know it's working
+    if (now >= nextBeep) { tone(330, .05, .15 * quiet); nextBeep = now + 1200; }
+    if (state.mode === "locked" && now - state.lastSeen > LOST_MS) {
+      state.mode = "search"; state.turned = 0; state.startedAt = now; state.everSeen = false;
+      status("Finding " + state.target, "busy"); show("Finding: " + state.target);
+      say("Lost it. Turn in a circle again.");
+    }
+    if (state.mode === "search" && !state.lastSeen &&
+        ((gyroOK && state.turned > GIVE_UP_DEG * 1.5) || now - state.startedAt > GIVE_UP_MS)) {
+      stopFind(`I can't find ${withArticle(state.target)} here. Try another spot, or ask for something else.`);
+      show("Not found: " + state.target);
+    } else if (state.mode === "search") {
+      if (gyroOK && turnRate > FAST_TURN) {
+        if (!state.fastSince) state.fastSince = now;
+        else if (now - state.fastSince > 700) cue("A little slower.", 5000, now);
+      } else state.fastSince = 0;
+      if (now - state.startedAt > 7000) cue("Keep turning.", 7000, now);
+    }
+    return;
+  }
+
+  const a = Math.abs(off), f = state.fix, centered = a < LOCK_DEG, locked = state.mode === "locked";
+  // Beeps. Off target: low beeps in the ear on that side, rising as you get closer to facing it.
+  // On target: bright high beeps in both ears. Once locked, on-target beeps speed up as you walk closer.
+  if (now >= nextBeep) {
+    const vol = (now - state.lastSeen < 2500 ? .4 : .22) * quiet;
+    const k = Math.min(a, 90) / 90;
+    if (centered) tone(1320, .07, vol, 0, "triangle");
+    else tone(420 + (1 - k) * 380, .07, vol, off > 0 ? 1 : -1, "sine");
+    if (centered && locked) {
+      const d = Math.max(1, Math.min(10, f.dist || f.steps || 6));
+      nextBeep = now + 110 + (d - 1) / 9 * 650;
+    } else nextBeep = now + (centered ? 140 : 200 + k * 500);
+  }
+
+  if (centered) { if (!state.centeredSince) state.centeredSince = now; state.offSince = 0; }
+  else { state.centeredSince = 0; if (!state.offSince) state.offSince = now; }
+
+  if (!locked) {
+    if (state.centeredSince && now - state.centeredSince > LOCK_MS) {
+      state.mode = "locked"; state.lastDistSaid = now; state.lastSteps = f.steps; state.lastCue = now;
+      chimeLock();
+      const dist = f.steps ? `, about ${f.steps} step${f.steps > 1 ? "s" : ""}` : "";
+      const line = `Stop. ${cap(f.label)}, straight ahead${dist}.${f.note ? " " + f.note + "." : ""}`;
+      const ses = state.session;
+      setTimeout(() => { if (ses === state.session && state.mode === "locked") say(line); }, 300);
+      status("Facing it", "on"); show(`${cap(f.label)} · ${f.steps ? f.steps + " steps" : "ahead"}`, true);
+    } else if (!centered && now - state.offSince > 400) {
+      cue(cap(turnWords(off)) + ".", 2500, now);
+    }
+    return;
+  }
+
+  // locked: walking toward it
+  if (f.steps && (f.dist || f.steps) <= ARRIVE_STEPS + .3) {
+    chimeArrive(); stopFind(`You're at the ${f.label}.`); show(`At the ${f.label}`, true); return;
+  }
+  if (!centered && now - state.offSince > 500) {
+    if (cue(cap(turnWords(off)) + ".", 2500, now)) status(cap(turnWords(off)), "busy");
+  } else if (centered && f.steps && now - state.lastDistSaid > 4000 && f.steps !== state.lastSteps && !speaking()) {
+    state.lastDistSaid = now; state.lastSteps = f.steps; state.lastCue = now;
+    say(`${f.steps} step${f.steps > 1 ? "s" : ""}.`, 1.15);
+    status("Facing it", "on"); show(`${cap(f.label)} · ${f.steps} steps`, true);
+  }
+}
+const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+
+function tellWhere() {
+  if (state.mode === "idle") return;
+  const off = offsetDeg(), f = state.fix;
+  if (off === null) { say(`Still looking for ${withArticle(state.target)}. Turn slowly.`); return; }
+  say(`${cap(f.label)}, ${sideWords(off)}${f.steps ? ", about " + f.steps + " steps" : ""}.`);
+}
+
+// ---------- drawing (for the person filming the demo) ----------
+const DPR = Math.min(1.5, devicePixelRatio || 1);
+function sizeCanvas() { cv.width = innerWidth * DPR; cv.height = innerHeight * DPR; }
+addEventListener("resize", sizeCanvas); sizeCanvas();
+function toScreen(x, y) {
+  const vw = video.videoWidth, vh = video.videoHeight, sw = cv.width, sh = cv.height;
+  const s = Math.max(sw / vw, sh / vh), ox = (sw - vw * s) / 2, oy = (sh - vh * s) / 2;
+  return { x: x * vw * s + ox, y: y * vh * s + oy, s: s };
+}
+function draw() {
+  cx.clearRect(0, 0, cv.width, cv.height);
+  if (!video.videoWidth) return;
+  drawEcho();
+  if (state.mode === "idle") { if (ring) drawRing(ring); return; }
+  const d = DPR, off = offsetDeg(), locked = state.mode === "locked";
+  const color = locked ? "#30d158" : "#ffb000";
+  const f = state.fix;
+  if (f && f.box && off !== null) {
+    // shift the box by how far the user has turned since the photo
+    const shift = (f.m - off) / hfov();
+    const a = toScreen(f.box.x - shift, f.box.y), b = toScreen(f.box.x + f.box.w - shift, f.box.y + f.box.h);
+    cx.lineWidth = 5 * d; cx.strokeStyle = color; cx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
+  }
+  // direction bar along the top
+  const y = 80 * d, cxm = cv.width / 2, half = cv.width * .4;
+  cx.lineWidth = 3 * d; cx.strokeStyle = "rgba(255,255,255,.4)";
+  cx.beginPath(); cx.moveTo(cxm - half, y); cx.lineTo(cxm + half, y); cx.stroke();
+  cx.beginPath(); cx.moveTo(cxm, y - 14 * d); cx.lineTo(cxm, y + 14 * d); cx.stroke();
+  if (off !== null) {
+    const px = cxm + Math.max(-1, Math.min(1, off / 45)) * half;
+    cx.fillStyle = color; cx.beginPath(); cx.arc(px, y, 13 * d, 0, Math.PI * 2); cx.fill();
+  }
+}
+
+let lastDraw = 0;
+function loop() {
+  const now = performance.now();
+  cameraWatchdog(now);
+  if (state.mode === "idle") handStep(now);
+  depthStep(now);
+  if (state.mode !== "idle") {
+    let t = performance.now(); localDetect(now); let cost = performance.now() - t;
+    if (cost > 8) lastLocal = now + cost * 2;          // slow phone: detect less often
+    t = performance.now(); trackStep(now); cost = performance.now() - t;
+    if (cost > 6) lastTrack = now + cost * 3;
+    guide(now);
+  }
+  if (now - lastDraw > 66) { lastDraw = now; draw(); }
+  stats.frames++;
+  if (now - stats.at > 1000) {
+    stats.fps = Math.round(stats.frames * 1000 / (now - stats.at)); stats.frames = 0; stats.at = now;
+    const dep = echo.ready ? `${echo.device} ${Math.round(echo.ms)} ms${echo.muted ? " paused" : ""}` : echo.err ? "OFF" : "loading";
+    $("foot").textContent = `${wideCam ? "wide" : "normal"} cam · depth ${dep} · hand ${hands ? "on" : "-"} · motion ${gyroOK ? "on" : "OFF"} · AI ${stats.aiMs ? Math.round(stats.aiMs) + " ms" : "-"} · ${stats.fps} fps · ${VERSION}`;
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------- camera ----------
+// Normal lens by default (best for pointing and reading). Find switches to the ultra-wide lens when the
+// phone has one, and switches back when it ends. iPhone web pages can only use one camera at a time.
+// Add ?wide=0 to the URL to never use the ultra-wide lens.
+let wideId = null, wantWide = false, camJob = Promise.resolve();
+async function openCam(wide) {
+  const video_ = wide
+    ? { deviceId: { exact: wideId }, width: { ideal: 960 }, height: { ideal: 720 }, aspectRatio: { ideal: 4 / 3 } }
+    : { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } };
+  const s2 = await navigator.mediaDevices.getUserMedia({ video: video_, audio: false });
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = s2; video.muted = true; video.srcObject = s2; await video.play();
+  s2.getVideoTracks()[0].addEventListener("unmute", () => video.play().catch(() => {}));
+  wideCam = wide; LONG_FOV = wide ? 104 : 64; lastFrameAt = performance.now();
+}
+async function findWideCam() {
+  if (Q.get("wide") === "0") return;
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const uw = devs.find(d => d.kind === "videoinput" && /ultra|超广角/i.test(d.label) && !/front|前置/i.test(d.label));
+    if (uw) wideId = uw.deviceId;
+  } catch (e) {}
+}
+function setCam(wide) {      // calls are queued, and only the latest wish is carried out
+  wantWide = wide;
+  camJob = camJob.then(async () => {
+    if (!wideId || wantWide === wideCam) return;
+    try { await openCam(wantWide); }
+    catch (e) { try { await openCam(false); } catch (e2) {} }
+  });
+  return camJob;
+}
+
+// ---------- Echo: obstacle radar from single-camera depth ----------
+// A depth model (in depth-worker.js) says how close things are in three strips of the view: left, ahead, right.
+// Each side has its own timbre AND its own ear:  left = low "tok", right = high "ting", ahead = "bzz" in both.
+// Distance is carried by speed (closer = faster). It stays quiet when nothing changes.
+const echo = { ready: false, err: "", device: "", ms: 0, pending: false, sent: 0, at: 0, muted: false,
+  cols: [0, 0, 0], side: 1, c: 0, since: 0, hist: [], thumb: null, tw: 0, th: 0, lastSpeak: 0, lastKey: "" };
+const SIDES = ["left", "ahead", "right"];
+let depthWorker = null, lastHandSeen = 0;
+const dcv = document.createElement("canvas"), dctx = dcv.getContext("2d", { willReadFrequently: true });
+const thumbCv = document.createElement("canvas");
+
+function startDepth() {
+  if (Q.get("depth") === "0") { echo.err = "off"; return; }
+  try {
+    depthWorker = new Worker("depth-worker.js", { type: "module" });
+    window.__dw = depthWorker;   // for testing from the console
+    depthWorker.onmessage = e => {
+      const m = e.data;
+      if (m.type === "ready") { echo.ready = true; echo.device = m.device === "webgpu" ? "gpu" : "cpu"; }
+      else if (m.type === "error") {
+        echo.pending = false;
+        if (!echo.ready) { echo.err = m.msg; if (!speaking()) say("The obstacle radar could not start. The other features still work."); }
+      }
+      else if (m.type === "depth") onDepth(m);
+    };
+    depthWorker.onerror = e => { echo.pending = false; if (!echo.ready) echo.err = e.message || "worker failed"; };
+    depthWorker.postMessage({ type: "init" });
+  } catch (e) { echo.err = String(e.message || e); }
+}
+function depthStep(now) {
+  if (!echo.ready || echo.pending || echo.muted || video.readyState < 2 || !video.videoWidth) return;
+  // never faster than the model can keep up with
+  const every = Math.max(finding() ? DEPTH_FIND_MS : DEPTH_MS, echo.ms * 1.5);
+  if (now - echo.sent < every) return;
+  const vw = video.videoWidth, vh = video.videoHeight, k = DEPTH_SIDE / Math.max(vw, vh);
+  const w = Math.max(14, Math.round(vw * k / 14) * 14), h = Math.max(14, Math.round(vh * k / 14) * 14);
+  if (dcv.width !== w || dcv.height !== h) { dcv.width = w; dcv.height = h; }
+  dctx.drawImage(video, 0, 0, w, h);
+  const buf = dctx.getImageData(0, 0, w, h).data.buffer;
+  echo.pending = true; echo.sent = now;
+  depthWorker.postMessage({ type: "frame", buf, w, h }, [buf]);
+}
+function onDepth(m) {
+  const now = performance.now();
+  echo.pending = false; echo.ms = echo.ms ? echo.ms * .7 + m.ms * .3 : m.ms; echo.at = now;
+  echo.cols = echo.cols.map((v, i) => v * .4 + m.cols[i] * .6);        // smooth so it doesn't jitter
+  echo.thumb = m.thumb; echo.tw = m.tw; echo.th = m.th;
+  // which side matters most: straight ahead counts a little more; switch sides only for a clear difference
+  const score = i => echo.cols[i] * (i === 1 ? 1.12 : 1);
+  let best = 0; for (let i = 1; i < 3; i++) if (score(i) > score(best)) best = i;
+  if (best !== echo.side && score(best) > score(echo.side) + .08) { echo.side = best; echo.since = now; echo.hist = []; }
+  const was = echo.c; echo.c = echo.cols[echo.side];
+  if (was < NEAR && echo.c >= NEAR) { echo.since = now; echo.hist = []; }
+  echo.hist.push([now, echo.c]);
+  while (echo.hist.length && now - echo.hist[0][0] > 1500) echo.hist.shift();
+  echoSpeak(now);
+}
+const VOICES = {
+  left:  { type: "triangle", freq: 440,  len: .06, peak: .9,  pan: -1 },
+  right: { type: "sine",     freq: 1480, len: .22, peak: .6,  pan: 1 },
+  ahead: { type: "sawtooth", freq: 220,  len: .12, peak: .35, pan: 0 }
+};
+function echoBeep(where, quiet) {
+  const v = VOICES[where];
+  tone(v.freq, v.len, v.peak * quiet, v.pan, v.type);
+  if (where === "right") tone(v.freq * 2.76, .12, .2 * quiet, 1, "sine");   // bell overtone makes "ting" unmistakable
+}
+// During Find the radar only speaks up for something very close, with a low hum that can't be
+// mistaken for Find's own beeps.
+function echoHum(i) { tone(110, .28, .5, i - 1, "sine"); tone(165, .28, .25, i - 1, "sine"); }
+function echoShouldBeep(now) {
+  if (echo.c < NEAR) return false;
+  if (echo.c >= CLOSE) return true;
+  if (now - echo.since < 1500) return true;                 // newly noticed
+  const first = echo.hist[0];
+  return !!first && echo.c - first[1] > .04;                // getting closer
+}
+function echoTick() {
+  let wait = 250;
+  const now = performance.now();
+  const live = echo.ready && !echo.muted && now - echo.at < 2000 && !listening && !busy;
+  if (live && finding()) {
+    // when locked you are walking straight at the target, so "ahead" is expected to get close
+    let s = -1;
+    for (let i = 0; i < 3; i++) {
+      if (i === 1 && state.mode === "locked") continue;
+      if (echo.cols[i] >= CLOSE && (s < 0 || echo.cols[i] > echo.cols[s])) s = i;
+    }
+    if (s >= 0) { echoHum(s); wait = 800; }
+  } else if (live && now - lastHandSeen > 1200 && echoShouldBeep(now)) {
+    // (your own hand in front of the camera is not an obstacle)
+    echoBeep(SIDES[echo.side], speaking() ? .35 : 1);
+    wait = 1000 - ((Math.min(echo.c, 1) - NEAR) / (1 - NEAR)) * 880;        // 1000 ms -> 120 ms
+  }
+  setTimeout(echoTick, wait);
+}
+function echoSpeak(now) {
+  if (finding() || busy || listening || speaking() || echo.c < CLOSE || now - lastHandSeen < 1200) return;
+  const key = SIDES[echo.side];
+  if (now - echo.lastSpeak < 2500) return;
+  if (key !== echo.lastKey || now - echo.lastSpeak > 6000) {
+    say(key === "ahead" ? "Close, ahead." : `Close, on your ${key}.`, 1.15);
+    echo.lastSpeak = now; echo.lastKey = key;
+  }
+}
+function drawEcho() {
+  if (!echo.ready || performance.now() - echo.at > 2000) return;
+  const d = DPR, w = cv.width, bw = w * .26, gap = w * .03, x0 = (w - bw * 3 - gap * 2) / 2, y = cv.height - 150 * d;
+  // three bars: how close things are on the left, ahead and on the right
+  for (let i = 0; i < 3; i++) {
+    const c = echo.cols[i];
+    cx.fillStyle = "rgba(255,255,255,.18)"; cx.fillRect(x0 + i * (bw + gap), y, bw, 10 * d);
+    cx.fillStyle = c >= CLOSE ? "#ff3b30" : c >= NEAR ? "#ffb000" : "rgba(255,255,255,.55)";
+    cx.fillRect(x0 + i * (bw + gap), y, bw * Math.min(1, c), 10 * d);
+  }
+  // small depth picture (bright = close), for the person filming
+  if (echo.thumb) {
+    if (thumbCv.width !== echo.tw || thumbCv.height !== echo.th) { thumbCv.width = echo.tw; thumbCv.height = echo.th; }
+    const tg = thumbCv.getContext("2d"), im = tg.createImageData(echo.tw, echo.th);
+    for (let i = 0; i < echo.thumb.length; i++) { const v = echo.thumb[i]; im.data[i * 4] = v; im.data[i * 4 + 1] = v; im.data[i * 4 + 2] = v; im.data[i * 4 + 3] = 255; }
+    tg.putImageData(im, 0, 0);
+    const tw = 84 * d, th = tw * echo.th / echo.tw;
+    cx.globalAlpha = .85; cx.drawImage(thumbCv, cv.width - tw - 12 * d, 70 * d, tw, th); cx.globalAlpha = 1;
+  }
+}
+
+// ---------- Point & Explain ----------
+let anchor = null, holdStart = 0, armed = true, lastDescribed = null, lastPointSeen = 0, lastHandDetect = 0,
+    lastProg = 0, lastAsk = 0, ring = null, lastRing = null;
+function side(x) { return x < .35 ? "On your left. " : x > .65 ? "On your right. " : "Ahead. "; }
+function isPointing(lm) {
+  const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+  const indexOut = d(8, 0) > d(6, 0) * 1.15;
+  const curled = [12, 16, 20].filter(t => d(t, 0) < d(t - 2, 0) * 1.05).length >= 2;
+  return indexOut && curled;
+}
+// Runs only when Find is not active. After describing something it stays quiet until the hand
+// drops or points somewhere new.
+function handStep(now) {
+  if (!hands) return;
+  if (busy || speaking() || listening) {       // while asking the AI or talking, don't track the hand at all
+    anchor = null; ring = busy && lastRing ? { ...lastRing, prog: 1, kind: "busy" } : null; return;
+  }
+  if (video.readyState < 2 || now - lastHandDetect < DETECT_EVERY) return;
+  lastHandDetect = now;
+  const t0 = performance.now();
+  const r = hands.detectForVideo(video, now);
+  const cost = performance.now() - t0;
+  if (cost > 30) lastHandDetect = now + cost;   // slow phone: look less often
+  const lm = r.landmarks && r.landmarks[0];
+  if (lm) lastHandSeen = now;
+  if (lm && isPointing(lm)) {
+    lastPointSeen = now;
+    const tip = lm[8], pip = lm[6];
+    const target = { x: tip.x + (tip.x - pip.x) * REACH, y: tip.y + (tip.y - pip.y) * REACH };
+    target.x = Math.min(.98, Math.max(.02, target.x)); target.y = Math.min(.98, Math.max(.02, target.y));
+    if (!armed && lastDescribed && Math.hypot(target.x - lastDescribed.x, target.y - lastDescribed.y) > REARM_DIST) armed = true;
+    if (!armed) { ring = { ...target, prog: 0, kind: "done" }; return; }
+    if (!anchor || Math.hypot(target.x - anchor.x, target.y - anchor.y) > STILL_PX) { anchor = target; holdStart = now; }
+    const prog = Math.min(1, (now - holdStart) / HOLD_MS);
+    ring = { ...target, prog, kind: "hold" }; lastRing = target;
+    if (prog >= 1 && now - lastAsk > COOLDOWN_MS) capture("point", null, target);
+    else if (prog < 1 && Math.floor(prog * 4) !== Math.floor(lastProg * 4)) tone(660, .03, .12, target.x * 2 - 1);
+    lastProg = prog;
+  } else {
+    anchor = null; lastProg = 0; ring = null;
+    if (!armed && now - lastPointSeen > DROP_MS) armed = true;
+  }
+}
+function drawRing(t) {
+  const p = toScreen(t.x, t.y), R = 46 * DPR;
+  cx.lineWidth = 6 * DPR;
+  if (t.kind === "done") {   // already described: dashed grey until the hand moves on
+    cx.setLineDash([8 * DPR, 10 * DPR]); cx.strokeStyle = "rgba(255,255,255,.35)";
+    cx.beginPath(); cx.arc(p.x, p.y, R, 0, Math.PI * 2); cx.stroke(); cx.setLineDash([]); return;
+  }
+  cx.strokeStyle = "rgba(255,255,255,.5)"; cx.beginPath(); cx.arc(p.x, p.y, R, 0, Math.PI * 2); cx.stroke();
+  cx.strokeStyle = t.kind === "busy" ? "#ffb000" : "#ff3b30";
+  cx.beginPath(); cx.arc(p.x, p.y, R, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * t.prog); cx.stroke();
+}
+
+// capture a frame and ask the AI:  point | scene | read | ask
+const WAIT_LINE = { scene: "Looking.", read: "Reading.", ask: "Let me look." };
+async function capture(mode, question, target) {
+  if (busy || !video.videoWidth) return;
+  busy = true; lastAsk = performance.now(); anchor = null;
+  if (mode === "point") { armed = false; lastDescribed = target; }
+  const wasFinding = finding();
+  status(mode === "read" ? "Reading" : "Looking", "busy");
+  tone(1320, .12, .3, target ? target.x * 2 - 1 : 0);
+  if (WAIT_LINE[mode]) say(WAIT_LINE[mode], 1.2);
+
+  // text needs more pixels than objects do
+  const W = mode === "read" ? 1280 : 768, H = Math.round(W * video.videoHeight / video.videoWidth);
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const g = c.getContext("2d"); g.drawImage(video, 0, 0, W, H);
+  if (mode === "point") {
+    g.lineWidth = 6; g.strokeStyle = "#ff0000";
+    g.beginPath(); g.arc(target.x * W, target.y * H, W * .08, 0, Math.PI * 2); g.stroke();
+  }
+  const image = c.toDataURL("image/jpeg", mode === "read" ? .85 : .7);
+  try {
+    const r = await fetch("/api/describe", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image, mode, question }) });
+    const j = await r.json();
+    const text = j.text || "Sorry, I couldn't get an answer.";
+    show(text, mode === "read" ? "read" : "");
+    say((mode === "point" ? side(target.x) : "") + text, mode === "read" ? 0.95 : 1.05);
+  } catch (err) { show("No connection"); say("No connection. Try again."); }
+  busy = false; lastAsk = performance.now();
+  if (finding()) status("Finding " + state.target, "busy"); else if (!wasFinding || !finding()) ready();
+}
+
+// ---------- start ----------
+$("go").onclick = async e => {
+  e.stopPropagation();
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  // iOS asks for motion permission; must be inside the tap
+  try {
+    if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === "function") {
+      const p = await DeviceOrientationEvent.requestPermission();
+      if (p === "granted") addEventListener("deviceorientation", onOrient);
+    } else addEventListener("deviceorientation", onOrient);
+  } catch (err) {}
+  say("Starting camera.");
+  $("start").style.display = "none";
+  try {
+    await openCam(false);
+    video.addEventListener("pause", () => video.play().catch(() => {}));
+    await findWideCam();
+    watchFrames();
+  } catch (err) { status("Camera blocked"); say("I can't open the camera. Check Safari camera permission."); return; }
+  started = true;
+  ready();
+  say("Ready. Tap to hear what's ahead. Hold the screen to ask a question, or say: find the door.");
+  keepAwake();
+  loop();
+  echoTick();
+  startDepth();              // obstacle radar comes on when its model has loaded
+  // the on-device models load in the background; tap and voice work straight away
+  try {
+    const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    if (Q.get("hands") !== "0") {
+      try {
+        hands = await HandLandmarker.createFromOptions(fs, {
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+          runningMode: "VIDEO", numHands: 1 });
+        if (!finding() && !busy && !listening) ready();
+      } catch (e) { hands = null; }
+    }
+    const opts = d => ({ baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite", delegate: d },
+      runningMode: "VIDEO", scoreThreshold: .35, maxResults: 6 });
+    try { detector = await ObjectDetector.createFromOptions(fs, opts("GPU")); }
+    catch (e) { detector = await ObjectDetector.createFromOptions(fs, opts("CPU")); }
+  } catch (err) { detector = null; }
+};
+
+// keep the screen on while walking
+async function keepAwake() { try { navigator.wakeLock && (await navigator.wakeLock.request("screen")); } catch (e) {} }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && started) keepAwake(); });
+
+// ---------- voice ----------
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, heard = "";
+function startListening() {
+  if (!SR) { const q = prompt("Ask a question, or type: find the door"); if (q) route(q); return; }
+  speechSynthesis.cancel();
+  heard = ""; listening = true;
+  rec = new SR(); rec.lang = "en-US"; rec.interimResults = true; rec.continuous = true;
+  rec.onresult = ev => { heard = [...ev.results].map(r => r[0].transcript).join(" ").trim(); $("heard").textContent = "“" + heard + "”"; };
+  rec.onerror = ev => {
+    if (ev.error === "not-allowed" || ev.error === "service-not-allowed")
+      say("I can't use the microphone. Allow it in Safari, and turn on Dictation in iPhone settings.");
+  };
+  rec.onend = () => { if (listening) finishListening(); };
+  try { rec.start(); } catch (err) {}
+  $("listening").style.display = "block"; $("heard").textContent = "";
+  status("Listening", "mic"); tone(520, .08, .3);
+}
+function finishListening() {
+  listening = false; $("listening").style.display = "none";
+  try { rec && rec.stop(); } catch (err) {}
+  setTimeout(() => {
+    const q = heard.trim();
+    setTimeout(() => { $("heard").textContent = ""; }, 3000);
+    if (!q) { if (finding()) status("Finding " + state.target, "busy"); else ready();
+      say("I didn't catch that. Hold the screen and try again."); return; }
+    if (!finding()) ready();
+    route(q);
+  }, 400);
+}
+// One voice, three jobs. What you say decides which one runs:
+//   "find the door", "where's a chair"        -> Find
+//   "read this", "what does it say"           -> read text aloud
+//   "what's in front of me", "describe"       -> describe the scene
+//   anything else                             -> the question goes to the AI with a photo
+//   "stop" ends Find · "pause" / "resume" switch the obstacle radar off and on
+const FIND_RE = /^(please |can you |could you |help me |i want to |i need to )*(find|where'?s|where is|where are|look for|search for|take me to|go to|get me to|i'm looking for|i am looking for)\b/;
+function route(q) {
+  const s = q.toLowerCase().replace(/[.,!?]/g, " ").replace(/\s+/g, " ").trim();
+  if (/^(stop|cancel|never ?mind|quit|end)\b/.test(s)) { if (finding()) return stopFind("Stopped."); speechSynthesis.cancel(); return; }
+  if (/^(pause|mute|quiet|be quiet)\b/.test(s)) { echo.muted = true; return say("Radar paused. Say resume to turn it back on."); }
+  if (/^(resume|unmute|radar on)\b/.test(s)) { echo.muted = false; return say("Radar on."); }
+  if (finding() && /^(where is it|where|repeat|again)$/.test(s)) return tellWhere();
+  if (/^where am i\b/.test(s)) return capture("scene");
+  if (FIND_RE.test(s)) {
+    if (/^(where'?s|where is) it$/.test(s) && state.lastTarget) return startFind(state.lastTarget);
+    return startFind(q);
+  }
+  if (/\bread\b|what does (it|this|that) say|what's written|\btext\b/.test(s)) return capture("read");
+  if (/(in front|ahead|around me|what do you see|what can you see|describe|what's there)/.test(s)) return capture("scene");
+  return capture("ask", q);
+}
+
+// ---------- press handling: long press = talk; short tap = where is it (during Find) or what's ahead ----------
+let pressTimer = null, pressed = false;
+function down(e) {
+  if (!started) return;
+  e.preventDefault(); pressed = true;
+  pressTimer = setTimeout(() => { pressTimer = null; startListening(); }, PRESS_MS);
+}
+function up() {
+  if (!pressed) return; pressed = false;
+  if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; tap(); }
+  else if (listening) finishListening();
+}
+function tap() { if (finding()) tellWhere(); else capture("scene"); }
+document.addEventListener("pointerdown", down);
+document.addEventListener("pointerup", up);
+document.addEventListener("pointercancel", up);
+
+// Desktop recording shortcuts: hold space = talk, Enter = tap, t = read, Esc = stop Find
+document.addEventListener("keydown", e => {
+  if (!started || e.repeat) return;
+  if (e.key === " ") { e.preventDefault(); startListening(); }
+  if (e.key === "Enter") tap();
+  if (e.key === "t") capture("read");
+  if (e.key === "Escape" && finding()) stopFind("Stopped.");
+});
+document.addEventListener("keyup", e => { if (e.key === " " && listening) finishListening(); });
+window.__vision = { route, state, echo, tap, onDepth }; // for testing from the console
+</script>
+</body>
+</html>
