@@ -6,7 +6,7 @@
 // in : { type:"init" }                                  -> { type:"ready", device } | { type:"error", msg }
 //      { type:"frame", buf, w, h }  (RGBA, w and h are multiples of 14)
 // out: { type:"depth", cols:[left, ahead, right], ms, thumb, tw, th }   (cols are closeness 0-1)
-import { pipeline, RawImage } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.2/dist/transformers.min.js";
+import { pipeline, RawImage, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.2/dist/transformers.min.js";
 
 const MODEL = "onnx-community/depth-anything-v2-small";
 // The part of the view that counts as "where you are about to walk"
@@ -14,12 +14,25 @@ const BAND_TOP = 0.30, BAND_BOTTOM = 0.65;                 // rows: roughly knee
 const COLS = [[0.10, 0.37], [0.37, 0.63], [0.63, 0.90]];   // left, ahead, right
 
 let pipe = null, proc = null;
+// iPhone Safari pages are not "cross-origin isolated", so multi-threaded WASM can't run there.
+// Ask for one thread up front instead of letting the runtime try and fail.
+env.backends.onnx.wasm.numThreads = 1;
+env.backends.onnx.wasm.proxy = false;
 
+const fails = [];
 async function init() {
-  // GPU first (fast, 50 MB download once); fall back to CPU (slower, 27 MB)
+  // GPU first (fast, downloaded once); then CPU (slower). Every failure is reported back so the
+  // phone can show WHY obstacle mode didn't start.
   const tries = [];
-  if (self.navigator && navigator.gpu) tries.push({ device: "webgpu", dtype: "fp16" });
+  let f16 = false;
+  if (self.navigator && navigator.gpu) {
+    try { const a = await navigator.gpu.requestAdapter(); f16 = !!(a && a.features.has("shader-f16")); if (!a) fails.push("gpu: no adapter"); }
+    catch (e) { fails.push("gpu: " + e.message); }
+    if (f16) tries.push({ device: "webgpu", dtype: "fp16" });
+    tries.push({ device: "webgpu", dtype: "fp32" });
+  } else fails.push("gpu: not in worker");
   tries.push({ device: "wasm", dtype: "q8" });
+  tries.push({ device: "wasm", dtype: "fp32" });
   let lastErr = null;
   for (const t of tries) {
     try {
@@ -28,11 +41,11 @@ async function init() {
       proc.do_resize = false;              // frames arrive already at model size
       // one warm-up run so a broken GPU path fails here and not on the first real frame
       await run(new Uint8ClampedArray(56 * 56 * 4).fill(128), 56, 56);
-      postMessage({ type: "ready", device: t.device });
+      postMessage({ type: "ready", device: t.device + (t.dtype === "fp16" ? "" : "-" + t.dtype), fails });
       return;
-    } catch (e) { lastErr = e; pipe = null; }
+    } catch (e) { lastErr = e; pipe = null; fails.push(`${t.device}/${t.dtype}: ${String((e && e.message) || e).slice(0, 80)}`); }
   }
-  postMessage({ type: "error", msg: String((lastErr && lastErr.message) || lastErr).slice(0, 200) });
+  postMessage({ type: "error", msg: fails.join(" | ").slice(0, 400) });
 }
 
 function halfToFloat(h) {

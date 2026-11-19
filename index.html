@@ -64,7 +64,7 @@ import { ObjectDetector, HandLandmarker, FilesetResolver } from "https://cdn.jsd
 // Any number below can be overridden from the URL for tuning on the phone, e.g. ?near=0.5&close=0.85
 const Q = new URLSearchParams(location.search);
 const num = (k, d) => Q.has(k) && isFinite(+Q.get(k)) ? +Q.get(k) : d;
-const VERSION = "v3";
+const VERSION = "v4";
 // Echo (obstacle radar from single-camera depth). Closeness is 0-1: 1 = as near as the nearest thing in view.
 const NEAR = num("near", .6);        // beeping starts
 const CLOSE = num("close", .9);      // always beeps and speaks; the only level that still warns during Find
@@ -553,7 +553,7 @@ function loop() {
   stats.frames++;
   if (now - stats.at > 1000) {
     stats.fps = Math.round(stats.frames * 1000 / (now - stats.at)); stats.frames = 0; stats.at = now;
-    const dep = echo.ready ? `${echo.device} ${Math.round(echo.ms)} ms${echo.muted ? " (off)" : ""}` : echo.err ? "OFF" : "loading";
+    const dep = echo.ready ? `${echo.device} ${Math.round(echo.ms)} ms${echo.muted ? " (off)" : ""}` : echo.err ? "ERROR" : "loading";
     $("foot").textContent = `${wideCam ? "wide" : "normal"} cam · depth ${dep} · hand ${hands ? "on" : "-"} · motion ${gyroOK ? "on" : "OFF"} · AI ${stats.aiMs ? Math.round(stats.aiMs) + " ms" : "-"} · ${stats.fps} fps · ${VERSION}`;
   }
   requestAnimationFrame(loop);
@@ -610,16 +610,19 @@ function startDepth() {
     window.__dw = depthWorker;   // for testing from the console
     depthWorker.onmessage = e => {
       const m = e.data;
-      if (m.type === "ready") { echo.ready = true; echo.device = m.device === "webgpu" ? "gpu" : "cpu"; if (!echo.muted && !finding() && !speaking()) say("Obstacle mode ready."); }
+      if (m.type === "ready") { echo.ready = true; echo.err = ""; echo.device = m.device.replace("webgpu", "gpu").replace("wasm", "cpu"); if (!echo.muted && !finding() && !speaking()) say("Obstacle mode ready."); }
       else if (m.type === "error") {
         echo.pending = false;
-        if (!echo.ready) { echo.err = m.msg; if (!echo.muted) { echo.muted = true; ready(); say("Obstacle mode could not start. The other features still work."); } }
+        if (!echo.ready) { echo.err = m.msg; if (!echo.muted) { echo.muted = true; ready(); show("Obstacle mode error: " + echo.err); say("Obstacle mode could not start. The other features still work."); } }
       }
       else if (m.type === "depth") onDepth(m);
     };
-    depthWorker.onerror = e => { echo.pending = false; if (!echo.ready) echo.err = e.message || "worker failed"; };
+    depthWorker.onerror = e => {
+      echo.pending = false;
+      if (!echo.ready) { echo.err = "worker: " + (e.message || "failed to load"); if (!echo.muted) { echo.muted = true; ready(); show("Obstacle mode error: " + echo.err); say("Obstacle mode could not start."); } }
+    };
     depthWorker.postMessage({ type: "init" });
-  } catch (e) { echo.err = String(e.message || e); }
+  } catch (e) { echo.err = "worker: " + String(e.message || e); }
 }
 function depthStep(now) {
   if (!echo.ready || echo.pending || echo.muted || video.readyState < 2 || !video.videoWidth) return;
@@ -923,7 +926,15 @@ function standby() {
 }
 function obstacleMode() {
   if (finding()) stopFind();
-  if (echo.err) { ready(); return say("Obstacle mode isn't available on this phone."); }
+  if (echo.err) {
+    show("Obstacle mode error: " + echo.err);
+    if (!echo.retried) {          // try loading once more (a flaky download is the usual cause)
+      echo.retried = true; echo.err = ""; echo.muted = false;
+      try { depthWorker && depthWorker.terminate(); } catch (e) {}
+      startDepth(); ready(); return say("Obstacle mode failed. Trying again, one moment.");
+    }
+    ready(); return say("Obstacle mode isn't available on this phone. The reason is on screen.");
+  }
   echo.muted = false; echo.at = 0; echo.cols = [0, 0, 0]; echo.c = 0; echo.lastKey = "";
   tone(390, .1, .3); tone(520, .14, .3, 0, "sine", .1);          // rising = on
   ready(); say(echo.ready ? "Obstacle mode on." : "Obstacle mode on. Still loading, one moment.");
