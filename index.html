@@ -64,7 +64,7 @@ import { ObjectDetector, HandLandmarker, FilesetResolver } from "https://cdn.jsd
 // Any number below can be overridden from the URL for tuning on the phone, e.g. ?near=0.5&close=0.85
 const Q = new URLSearchParams(location.search);
 const num = (k, d) => Q.has(k) && isFinite(+Q.get(k)) ? +Q.get(k) : d;
-const VERSION = "v6";
+const VERSION = "v7";
 // Echo (obstacle radar from single-camera depth). Closeness is 0-1: 1 = as near as the nearest thing in view.
 const NEAR = num("near", .6);        // beeping starts
 const CLOSE = num("close", .9);      // always beeps and speaks; the only level that still warns during Find
@@ -142,6 +142,11 @@ function show(text, cls) {
 }
 const finding = () => state.mode !== "idle";
 function ready() { status(echo.muted ? "Standby · hold to talk" : "Obstacle mode · hold to talk", "on"); }
+// ---------- audio route ----------
+// After the mic has been used, iPhone Safari keeps the page in "play and record" mode, which sends
+// speech to the quiet earpiece. Safari's Audio Session API lets the page ask for the loudspeaker.
+function audioMode(type) { try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch (e) {} }
+
 // ---------- speech out ----------
 // iPhone Safari stalls on the first syllable when speak() comes straight after cancel(), or straight
 // after the microphone was in use. So: cancel only when something is playing, wait a moment before
@@ -164,6 +169,7 @@ function say(text, rate = 1.05) {
     u.onstart = () => { speechNote = "talking"; };
     u.onend = () => { if (cur === u) cur = null; speechNote = "ok"; };
     u.onerror = e => { if (cur === u) cur = null; if (e.error !== "interrupted" && e.error !== "canceled") speechNote = "ERR " + e.error; };
+    audioMode("playback");
     cur = u; retried = false; lastSpoke = performance.now(); speechNote = "queued";
     curEnd = lastSpoke + 2500 + text.length * 90 / rate;   // generous time for this line
     speechSynthesis.speak(u);
@@ -729,7 +735,7 @@ function echoTick() {
       if (echo.cols[i] >= CLOSE && (s < 0 || echo.cols[i] > echo.cols[s])) s = i;
     }
     if (s >= 0) { echoHum(s); wait = 800; }
-  } else if (live && now - lastHandSeen > 1200 && echoShouldBeep(now)) {
+  } else if (live && now - lastHandSeen > 1200 && echoShouldBeep(now) && !(speaking() && echo.c < CLOSE)) {
     // (your own hand in front of the camera is not an obstacle)
     echoBeep(SIDES[echo.side], speaking() ? .35 : 1);
     wait = 1000 - ((Math.min(echo.c, 1) - NEAR) / (1 - NEAR)) * 880;        // 1000 ms -> 120 ms
@@ -910,6 +916,7 @@ let rec = null, heard = "";
 function startListening() {
   if (!SR) { const q = prompt("Ask a question, or type: find the door"); if (q) route(q); return; }
   hush();
+  audioMode("play-and-record");
   heard = ""; listening = true;
   rec = new SR(); rec.lang = "en-US"; rec.interimResults = true; rec.continuous = true;
   rec.onresult = ev => { heard = [...ev.results].map(r => r[0].transcript).join(" ").trim(); $("heard").textContent = "“" + heard + "”"; };
@@ -926,6 +933,7 @@ function finishListening() {
   listening = false; $("listening").style.display = "none";
   try { rec && rec.stop(); } catch (err) {}
   micOffAt = performance.now();
+  setTimeout(() => audioMode("playback"), 300);
   setTimeout(() => {
     const q = heard.trim();
     setTimeout(() => { $("heard").textContent = ""; }, 3000);
