@@ -64,7 +64,7 @@ import { ObjectDetector, HandLandmarker, FilesetResolver } from "https://cdn.jsd
 // Any number below can be overridden from the URL for tuning on the phone, e.g. ?near=0.5&close=0.85
 const Q = new URLSearchParams(location.search);
 const num = (k, d) => Q.has(k) && isFinite(+Q.get(k)) ? +Q.get(k) : d;
-const VERSION = "v5";
+const VERSION = "v6";
 // Echo (obstacle radar from single-camera depth). Closeness is 0-1: 1 = as near as the nearest thing in view.
 const NEAR = num("near", .6);        // beeping starts
 const CLOSE = num("close", .9);      // always beeps and speaks; the only level that still warns during Find
@@ -128,6 +128,7 @@ function cameraWatchdog(now) {
   if (!video.requestVideoFrameCallback && video.currentTime !== lastVT) { lastVT = video.currentTime; lastFrameAt = now; }
   if (!lastFrameAt) { lastFrameAt = now; return; }
   const stuck = now - lastFrameAt;
+  if (cur || speechSynthesis.speaking || now - lastSpoke < 800) { lastFrameAt = now; return; }   // leave the camera alone while talking
   if (stuck > 600 && now - lastKick > 1000) {
     lastKick = now;
     if (stuck > 4000) { video.srcObject = null; video.srcObject = stream; watchFrames(); lastFrameAt = now; }
@@ -146,6 +147,7 @@ function ready() { status(echo.muted ? "Standby · hold to talk" : "Obstacle mod
 // after the microphone was in use. So: cancel only when something is playing, wait a moment before
 // speaking, wait for the mic to settle, keep the utterance referenced (Safari can drop it otherwise),
 // and if a line never finishes, cut it and say it once more.
+let speechNote = "-";        // last speech event, shown in the bottom line
 let lastSpoke = 0, micOffAt = 0, sayTimer = null, sayJob = 0, cur = null, curEnd = 0, retried = false;
 const CANCEL_GAP = 150;      // ms between cancel() and the next speak()
 const MIC_GAP = 600;         // ms after the mic stops before speaking
@@ -159,8 +161,10 @@ function say(text, rate = 1.05) {
   const go = () => {
     if (job !== sayJob || listening) return;
     const u = new SpeechSynthesisUtterance(text); u.rate = rate; u.lang = "en-US";
-    u.onend = u.onerror = () => { if (cur === u) { cur = null; } };
-    cur = u; retried = false; lastSpoke = performance.now();
+    u.onstart = () => { speechNote = "talking"; };
+    u.onend = () => { if (cur === u) cur = null; speechNote = "ok"; };
+    u.onerror = e => { if (cur === u) cur = null; if (e.error !== "interrupted" && e.error !== "canceled") speechNote = "ERR " + e.error; };
+    cur = u; retried = false; lastSpoke = performance.now(); speechNote = "queued";
     curEnd = lastSpoke + 2500 + text.length * 90 / rate;   // generous time for this line
     speechSynthesis.speak(u);
   };
@@ -177,11 +181,14 @@ setInterval(() => {
     if (!retried) {
       setTimeout(() => {
         const v = new SpeechSynthesisUtterance(u.text); v.rate = u.rate; v.lang = u.lang;
-        v.onend = v.onerror = () => { if (cur === v) cur = null; };
+        v.onstart = () => { speechNote = "talking (retry)"; };
+        v.onend = () => { if (cur === v) cur = null; speechNote = "ok (retry)"; };
+        v.onerror = e => { if (cur === v) cur = null; speechNote = "ERR " + e.error; };
+        speechNote = "STALLED, retrying";
         cur = v; retried = true; curEnd = performance.now() + 2500 + u.text.length * 90 / u.rate;
         speechSynthesis.speak(v);
       }, CANCEL_GAP);
-    }
+    } else speechNote = "STALLED twice";
   }
 }, 500);
 function hush() { sayJob++; clearTimeout(sayTimer); cur = null; speechSynthesis.cancel(); }
@@ -592,7 +599,7 @@ function loop() {
   if (now - stats.at > 1000) {
     stats.fps = Math.round(stats.frames * 1000 / (now - stats.at)); stats.frames = 0; stats.at = now;
     const dep = echo.ready ? `${echo.device} ${Math.round(echo.ms)} ms${echo.muted ? " (off)" : ""}` : echo.err ? "ERROR" : "loading";
-    $("foot").textContent = `${wideCam ? "wide" : "normal"} cam · depth ${dep} · hand ${hands ? "on" : "-"} · motion ${gyroOK ? "on" : "OFF"} · AI ${stats.aiMs ? Math.round(stats.aiMs) + " ms" : "-"} · ${stats.fps} fps · ${VERSION}`;
+    $("foot").textContent = `${wideCam ? "wide" : "normal"} cam · depth ${dep} · hand ${hands ? "on" : "-"} · motion ${gyroOK ? "on" : "OFF"} · AI ${stats.aiMs ? Math.round(stats.aiMs) + " ms" : "-"} · speech ${speechNote} · ${stats.fps} fps · ${VERSION}`;
   }
   requestAnimationFrame(loop);
 }
