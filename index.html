@@ -64,7 +64,7 @@ import { ObjectDetector, HandLandmarker, FilesetResolver } from "https://cdn.jsd
 // Any number below can be overridden from the URL for tuning on the phone, e.g. ?near=0.5&close=0.85
 const Q = new URLSearchParams(location.search);
 const num = (k, d) => Q.has(k) && isFinite(+Q.get(k)) ? +Q.get(k) : d;
-const VERSION = "v4";
+const VERSION = "v5";
 // Echo (obstacle radar from single-camera depth). Closeness is 0-1: 1 = as near as the nearest thing in view.
 const NEAR = num("near", .6);        // beeping starts
 const CLOSE = num("close", .9);      // always beeps and speaks; the only level that still warns during Find
@@ -141,13 +141,51 @@ function show(text, cls) {
 }
 const finding = () => state.mode !== "idle";
 function ready() { status(echo.muted ? "Standby · hold to talk" : "Obstacle mode · hold to talk", "on"); }
-let lastSpoke = 0;
+// ---------- speech out ----------
+// iPhone Safari stalls on the first syllable when speak() comes straight after cancel(), or straight
+// after the microphone was in use. So: cancel only when something is playing, wait a moment before
+// speaking, wait for the mic to settle, keep the utterance referenced (Safari can drop it otherwise),
+// and if a line never finishes, cut it and say it once more.
+let lastSpoke = 0, micOffAt = 0, sayTimer = null, sayJob = 0, cur = null, curEnd = 0, retried = false;
+const CANCEL_GAP = 150;      // ms between cancel() and the next speak()
+const MIC_GAP = 600;         // ms after the mic stops before speaking
 function say(text, rate = 1.05) {
-  speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text); u.rate = rate; u.lang = "en-US";
-  speechSynthesis.speak(u); lastSpoke = performance.now();
+  const job = ++sayJob;
+  lastSpoke = performance.now();
+  clearTimeout(sayTimer);
+  let wait = 0;
+  if (speechSynthesis.speaking || speechSynthesis.pending) { speechSynthesis.cancel(); wait = CANCEL_GAP; }
+  wait = Math.max(wait, micOffAt + MIC_GAP - performance.now());
+  const go = () => {
+    if (job !== sayJob || listening) return;
+    const u = new SpeechSynthesisUtterance(text); u.rate = rate; u.lang = "en-US";
+    u.onend = u.onerror = () => { if (cur === u) { cur = null; } };
+    cur = u; retried = false; lastSpoke = performance.now();
+    curEnd = lastSpoke + 2500 + text.length * 90 / rate;   // generous time for this line
+    speechSynthesis.speak(u);
+  };
+  if (wait > 0) sayTimer = setTimeout(go, wait); else go();
 }
-const speaking = () => speechSynthesis.speaking && performance.now() - lastSpoke < 15000;
+// stall check, twice a second
+setInterval(() => {
+  if (!cur) return;
+  const now = performance.now();
+  if (speechSynthesis.paused) speechSynthesis.resume();
+  if (now > curEnd) {
+    const u = cur; cur = null;
+    speechSynthesis.cancel();
+    if (!retried) {
+      setTimeout(() => {
+        const v = new SpeechSynthesisUtterance(u.text); v.rate = u.rate; v.lang = u.lang;
+        v.onend = v.onerror = () => { if (cur === v) cur = null; };
+        cur = v; retried = true; curEnd = performance.now() + 2500 + u.text.length * 90 / u.rate;
+        speechSynthesis.speak(v);
+      }, CANCEL_GAP);
+    }
+  }
+}, 500);
+function hush() { sayJob++; clearTimeout(sayTimer); cur = null; speechSynthesis.cancel(); }
+const speaking = () => (!!cur || speechSynthesis.speaking) && performance.now() - lastSpoke < 15000;
 function tone(freq, dur, vol, pan = 0, type = "sine", when = 0) {
   if (!actx) return;
   const t = actx.currentTime + when;
@@ -864,7 +902,7 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null, heard = "";
 function startListening() {
   if (!SR) { const q = prompt("Ask a question, or type: find the door"); if (q) route(q); return; }
-  speechSynthesis.cancel();
+  hush();
   heard = ""; listening = true;
   rec = new SR(); rec.lang = "en-US"; rec.interimResults = true; rec.continuous = true;
   rec.onresult = ev => { heard = [...ev.results].map(r => r[0].transcript).join(" ").trim(); $("heard").textContent = "“" + heard + "”"; };
@@ -872,7 +910,7 @@ function startListening() {
     if (ev.error === "not-allowed" || ev.error === "service-not-allowed")
       say("I can't use the microphone. Allow it in Safari, and turn on Dictation in iPhone settings.");
   };
-  rec.onend = () => { if (listening) finishListening(); };
+  rec.onend = () => { micOffAt = performance.now(); if (listening) finishListening(); };
   try { rec.start(); } catch (err) {}
   $("listening").style.display = "block"; $("heard").textContent = "";
   status("Listening", "mic"); tone(520, .08, .3);
@@ -880,6 +918,7 @@ function startListening() {
 function finishListening() {
   listening = false; $("listening").style.display = "none";
   try { rec && rec.stop(); } catch (err) {}
+  micOffAt = performance.now();
   setTimeout(() => {
     const q = heard.trim();
     setTimeout(() => { $("heard").textContent = ""; }, 3000);
@@ -898,7 +937,7 @@ function finishListening() {
 const FIND_RE = /^(please |can you |could you |help me |i want to |i need to )*(find|where'?s|where is|where are|look for|search for|take me to|go to|get me to|i'm looking for|i am looking for)\b/;
 function route(q) {
   const s = q.toLowerCase().replace(/[.,!?]/g, " ").replace(/\s+/g, " ").trim();
-  if (/^(stop|cancel|never ?mind|quit|end)\b/.test(s)) { if (finding()) return stopFind("Stopped."); speechSynthesis.cancel(); return; }
+  if (/^(stop|cancel|never ?mind|quit|end)\b/.test(s)) { if (finding()) return stopFind("Stopped."); hush(); return; }
   if (/^(pause|mute|quiet|be quiet|standby)\b/.test(s)) return standby();
   if (/^(resume|unmute|radar on|obstacle mode|obstacles)\b/.test(s)) return obstacleMode();
   if (finding() && /^(where is it|where|repeat|again)$/.test(s)) return tellWhere();
@@ -920,7 +959,7 @@ const DOUBLE_MS = num("double", 450);   // two taps closer together than this = 
 let tapTimer = null;
 function standby() {
   if (finding()) stopFind();
-  echo.muted = true; speechSynthesis.cancel(); show("");
+  echo.muted = true; hush(); show("");
   tone(520, .1, .3); tone(390, .14, .3, 0, "sine", .1);          // falling = off
   ready(); say("Standby.");
 }
